@@ -2,6 +2,7 @@ import torch
 import torch.utils.data
 import numpy
 import math
+import random
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
@@ -15,7 +16,6 @@ class Options:
     rnn_hidden_size, 
     attention_hidden_size, 
     amplification, 
-    perturbation, 
     training_batch_size, 
     test_batch_size, 
     total_epochs, 
@@ -27,7 +27,6 @@ class Options:
         self.rnn_hidden_size = rnn_hidden_size
         self.attention_hidden_size = attention_hidden_size
         self.amplification = amplification
-        self.perturbation = perturbation
         self.training_batch_size = training_batch_size
         self.test_batch_size = test_batch_size
         self.total_epochs = total_epochs
@@ -37,11 +36,10 @@ PAD = numpy.array([0.0, 0.0, 0.0, 0.0, 0.0, math.sin(0.0), math.sin(0.0)])
 
 class Dataset(torch.utils.data.Dataset):
 
-    def __init__(self, filename, perturbation=0):
+    def __init__(self, filename):
         self.X_seq_list = []
         self.Y_seq_list = []
         self._read_data(filename)
-        self._perturb_data(perturbation)
 
     def _read_data(self, filename):
         f = open(filename, 'r')
@@ -62,37 +60,6 @@ class Dataset(torch.utils.data.Dataset):
 
             self.X_seq_list.append(X_seq)
             self.Y_seq_list.append(Y_seq)
-
-    def _perturb_data(self, perturbation):
-        X_seq_list = []
-        Y_seq_list = []
-        
-        for X_seq, Y_seq in zip(self.X_seq_list, self.Y_seq_list):
-            X_seq_list.append(numpy.array(X_seq))
-            Y_seq_list.append(numpy.array(Y_seq))
-
-            for i in range(perturbation):
-                perm = numpy.random.permutation(len(X_seq))
-                permuted_X_seq = numpy.empty((len(X_seq), 7))
-                permuted_Y_seq = numpy.empty(len(Y_seq))
-
-                for i in range(len(X_seq)):
-                    permuted_X_seq[perm[i]] = X_seq[i]
-                
-                for i in range(len(Y_seq)):
-                    permuted_Y_seq[i] = perm[Y_seq[i] - 1] + 1
-
-                m = min(permuted_Y_seq)
-                permuted_Y_seq = permuted_Y_seq[:-1]
-                while permuted_Y_seq[0] != m:
-                    permuted_Y_seq = numpy.roll(permuted_Y_seq, 1)
-                permuted_Y_seq = numpy.append(permuted_Y_seq, permuted_Y_seq[0])
-
-                X_seq_list.append(permuted_X_seq)
-                Y_seq_list.append(permuted_Y_seq)
-        
-        self.X_seq_list = X_seq_list
-        self.Y_seq_list = Y_seq_list
 
     def __len__(self):
         return len(self.X_seq_list)
@@ -236,8 +203,8 @@ class PointerNetwork(torch.nn.Module):
             indices = torch.stack(indices[::-1], dim=1) # (batch, Y_seq_length)
             return probabilities, indices
 
-def trainOneEpoch(dataLoader, model, training, optimizer=None, amplification=None):
-    average_loss = torch.tensor(0.0)
+def trainOneEpoch(dataLoader, model, optimizer):
+    average_loss = 0.0
     batch_count = 0
     correct_samples = 0
     total_samples = 0
@@ -248,30 +215,72 @@ def trainOneEpoch(dataLoader, model, training, optimizer=None, amplification=Non
         Y_samples = samples[1] # (batch, Y_seq_length)
         X_seq_length = X_samples.size(1)
 
-        probabilities, indices = model(X_samples, training, Y_samples, amplification) # probabilities:(batch, Y_seq_length, X_seq_length), indices:(batch, Y_seq_length)
+        probabilities, indices = model(X_samples, True, Y_samples) # probabilities:(batch, Y_seq_length, X_seq_length), indices:(batch, Y_seq_length)
+
         correct_samples += sum([1 if torch.equal(x.data, y.data) else 0 for x, y in zip(indices, Y_samples)])
         total_samples += Y_samples.size(0)
 
-        P_samples = probabilities.view(-1, X_seq_length) # (batch * Y_seq_length, X_seq_length)
+        probabilities = probabilities.view(-1, X_seq_length) # (batch * Y_seq_length, X_seq_length)
         Y_samples = Y_samples.view(-1) # (batch * Y_seq_length)
-        loss = torch.nn.functional.nll_loss(P_samples, Y_samples) # (1)
+        loss = torch.nn.functional.nll_loss(probabilities, Y_samples) # (1)
 
-        if training:
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
 
-        average_loss += loss.detach()
+        average_loss += loss.item()
         batch_count += 1
 
-    average_loss /= batch_count
+    return average_loss / batch_count, correct_samples / total_samples
+
+def testOneEpoch(dataLoader, model, amplification=1):
+    average_loss = 0.0
+    batch_count = 0
+    correct_samples = 0
+    total_samples = 0
+    incorrect_samples = []
+
+    for samples in dataLoader:
     
-    return average_loss, correct_samples / total_samples
+        X_samples = samples[0] # (batch, X_seq_length, input_size)
+        Y_samples = samples[1] # (batch, Y_seq_length)
+        X_seq_length = X_samples.size(1)
+
+        probabilities, indices = model(X_samples, False, Y_samples, amplification) # probabilities:(batch, Y_seq_length, X_seq_length), indices:(batch, Y_seq_length)
+        total_samples += Y_samples.size(0)
+
+        batch_loss = 0.0
+        for i in range(Y_samples.size(0)):
+            loss = torch.nn.functional.nll_loss(probabilities[i], Y_samples[i])
+
+            if torch.equal(indices[i], Y_samples[i]):
+                correct_samples += 1
+            else:
+                incorrect_samples.append([X_samples[i], Y_samples[i], indices[i]])
+
+            batch_loss += loss.item()
+
+        average_loss += batch_loss / Y_samples.size(0)
+        batch_count += 1
+
+    return average_loss / batch_count, correct_samples / total_samples, random.choices(incorrect_samples, k=3)
+
+def normalizeIncorrectSample(sample):
+    points = sample[0].tolist()
+    Y_indices = sample[1].tolist()
+    P_indices = sample[2].tolist()
+
+    points = [e[:2] for e in points]
+    points = [e for e in points if e != points[0]]
+    Y_indices = [e for e in Y_indices if e != 0]
+    P_indices = [e for e in P_indices if e != 0]
+
+    return [points, Y_indices, P_indices]
 
 def train(options):
     print(options.__dict__)
 
-    trainingDataset = Dataset(options.training_data_filename, options.perturbation)
+    trainingDataset = Dataset(options.training_data_filename)
     testDataset = Dataset(options.test_data_filename)
     trainingDataLoader = torch.utils.data.DataLoader(trainingDataset, shuffle=True, collate_fn=collate_fn, batch_size=options.training_batch_size)
     testDataLoader = torch.utils.data.DataLoader(testDataset, shuffle=True, collate_fn=collate_fn, batch_size=options.test_batch_size)
@@ -299,12 +308,12 @@ def train(options):
     for epoch in range(last_epoch + 1, options.total_epochs + 1):
 
         model.train()
-        training_loss, training_accuracy = trainOneEpoch(trainingDataLoader, model, True, optimizer=optimizer)
+        training_loss, training_accuracy = trainOneEpoch(trainingDataLoader, model, optimizer)
 
         model.eval()
         with torch.no_grad():
-            test_loss_beam_search, test_accuracy_beam_search = trainOneEpoch(testDataLoader, model, False, amplification=options.amplification)
-            test_loss, test_accuracy = trainOneEpoch(testDataLoader, model, False, amplification=1)
+            test_loss_beam_search, test_accuracy_beam_search, incorrect_samples_beam_search = testOneEpoch(testDataLoader, model, options.amplification)
+            test_loss, test_accuracy, _ = testOneEpoch(testDataLoader, model)
 
         lr = optimizer.param_groups[0]['lr']
 
@@ -313,12 +322,18 @@ def train(options):
         print('Epoch: {:3}, LR: {:.3e}, Training: ({:.3f}, {:.1f}%), Test: ({:.3f}, {:.1f}%) ({:.3f}, {:.1f}%)'.format(
             epoch, 
             lr,
-            training_loss.item(),
+            training_loss,
             training_accuracy * 100, 
-            test_loss_beam_search.item(),
+            test_loss_beam_search,
             test_accuracy_beam_search * 100,
-            test_loss.item(),
+            test_loss,
             test_accuracy * 100))
+
+        incorrect_samples_beam_search = [normalizeIncorrectSample(sample) for sample in incorrect_samples_beam_search]
+
+        for sample in incorrect_samples_beam_search:
+            print(sample)
+        print()
 
         torch.save({
             'epoch': epoch,
@@ -336,7 +351,6 @@ if __name__ == '__main__':
         rnn_hidden_size=128,
         attention_hidden_size=128, 
         amplification=3,
-        perturbation=4,
         training_batch_size=500, 
         test_batch_size=50,
         total_epochs=100))
