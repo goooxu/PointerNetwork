@@ -18,8 +18,6 @@ class App extends React.Component {
         const inputText = e.target.value;
         const inputObject = JSON.parse(inputText);
 
-        console.log(inputObject);
-
         const points = [];
         for (let i = 0; i < inputObject[0].length; i++) {
             points.push({
