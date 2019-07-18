@@ -1,0 +1,368 @@
+import torch
+import torch.utils.data
+import numpy
+import math
+import random
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+class Options:
+    
+    def __init__(self, 
+    training_data_filename, 
+    test_data_filename,
+    input_size, 
+    embedding_size, 
+    rnn_hidden_size, 
+    attention_hidden_size, 
+    lstm_layers,
+    fc_layers,
+    amplification, 
+    training_batch_size, 
+    test_batch_size, 
+    total_epochs, 
+    checkpoint=None):
+        self.training_data_filename = training_data_filename
+        self.test_data_filename = test_data_filename
+        self.input_size = input_size
+        self.embedding_size = embedding_size
+        self.rnn_hidden_size = rnn_hidden_size
+        self.attention_hidden_size = attention_hidden_size
+        self.lstm_layers = lstm_layers
+        self.fc_layers = fc_layers
+        self.amplification = amplification
+        self.training_batch_size = training_batch_size
+        self.test_batch_size = test_batch_size
+        self.total_epochs = total_epochs
+        self.checkpoint = checkpoint
+
+PAD = numpy.array([0.0, 0.0, 0.0, 0.0, 0.0, math.sin(0.0), math.sin(0.0)])
+
+class Dataset(torch.utils.data.Dataset):
+
+    def __init__(self, filename):
+        self.X_seq_list = []
+        self.Y_seq_list = []
+        self._read_data(filename)
+
+    def _read_data(self, filename):
+        f = open(filename, 'r')
+        for line in f:
+            columns = line.split()
+            separator = columns.index('output')
+            X_seq = [float(i) for i in columns[:separator]]
+            X_seq = [i for i in zip(X_seq[::2], X_seq[1::2])]
+            X_seq = [(
+                i[0], 
+                i[1], 
+                i[0] * i[0], 
+                i[1] * i[1],
+                i[0] * i[1],
+                math.sin(i[0] * math.pi / 2),
+                math.sin(i[1] * math.pi / 2)) for i in X_seq]
+            Y_seq = [int(i) for i in columns[separator + 1:]]
+
+            self.X_seq_list.append(X_seq)
+            self.Y_seq_list.append(Y_seq)
+
+    def __len__(self):
+        return len(self.X_seq_list)
+
+    def __getitem__(self, idx):
+        X_seq = self.X_seq_list[idx]
+        Y_seq = self.Y_seq_list[idx]
+        return numpy.concatenate(([PAD], X_seq)), Y_seq
+
+def collate_fn(data):
+    X, Y = zip(*data)
+
+    max_length = len(max(X, key=len))
+    X = [numpy.concatenate((i, numpy.array([PAD] * (max_length - len(i))).reshape(-1, 7))) for i in X]
+
+    max_length = len(max(Y, key=len))
+    Y = [numpy.concatenate((i, numpy.array([0] * (max_length - len(i))))) for i in Y]
+
+    X = torch.tensor(X, dtype=torch.float, device=device)
+    Y = torch.tensor(Y, dtype=torch.long, device=device)
+    return X, Y
+
+class PointerNetwork(torch.nn.Module):
+    
+    def __init__(self, input_size, embedding_size, rnn_hidden_size, attention_hidden_size, lstm_layers, fc_layers):
+        super(PointerNetwork, self).__init__()
+        
+        self.lstm_layers = lstm_layers
+        self.fc_layers = fc_layers
+        self.fc0 = torch.nn.Linear(input_size, embedding_size, bias=False)
+        self.encoder = torch.nn.LSTM(embedding_size, rnn_hidden_size, bias=False, num_layers=lstm_layers, batch_first=True)
+        self.decoders = torch.nn.ModuleList(
+            [torch.nn.LSTMCell(embedding_size, rnn_hidden_size, bias=False)] + 
+            [torch.nn.LSTMCell(rnn_hidden_size, rnn_hidden_size, bias=False) for i in range(1, lstm_layers)])
+        self.fc1 = torch.nn.Linear(rnn_hidden_size, attention_hidden_size, bias=False)
+        self.fc2 = torch.nn.Linear(rnn_hidden_size, attention_hidden_size, bias=False)
+        self.fc3s = torch.nn.ModuleList([torch.nn.Linear(attention_hidden_size, attention_hidden_size, bias=False) for i in range(fc_layers)])
+        self.fc4 = torch.nn.Linear(attention_hidden_size, 1, bias=False)
+        
+    def forward(self, X, training, Y, amplification=None): # X:(batch, X_seq_length, input_size), Y:(batch, Y_seq_length)
+        batch_size = X.size(0)
+        Y_seq_length = Y.size(1)
+
+        X = self.fc0(X) # (batch, X_seq_length, embedding_size)
+        
+        encoder_outputs, (encoder_hidden_states, encoder_cell_states) = self.encoder(X) # encoder_outputs:(batch, X_seq_length, rnn_hidden_size), encoder_hidden_state:(1, batch, rnn_hidden_size), encoder_cell_state:(1, batch, rnn_hidden_size)
+        encoder_outputs = encoder_outputs.transpose(1, 0) # (X_seq_length, batch, rnn_hidden_size)
+        encoder_outputs = self.fc1(encoder_outputs)  # (X_seq_length, batch, attention_hidden_size)
+        
+        hidden_states = [encoder_hidden_states[i] for i in range(self.lstm_layers)] # (batch, rnn_hidden_size)
+        cell_states = [encoder_cell_states[i] for i in range(self.lstm_layers)] # (batch, rnn_hidden_size)
+        decoder_input = X[:, 0] # (batch, embedding_size)
+
+        if training:
+
+            probabilities = []
+
+            for i in range(Y_seq_length):
+                for j in range(self.lstm_layers):
+                    hidden_states[j], cell_states[j] = self.decoders[j](decoder_input, (hidden_states[j], cell_states[j])) # hidden_state:(batch, rnn_hidden_size), cell_state:(batch, rnn_hidden_size)
+                    decoder_input = hidden_states[j]
+                decoder_output = self.fc2(decoder_input) # (batch, attention_hidden_size)
+                        
+                blended_output = torch.tanh(encoder_outputs + decoder_output) # (X_seq_length, batch, attention_hidden_size)
+                for j in range(self.fc_layers):
+                    blended_output = torch.tanh(self.fc3s[j](blended_output)) # (X_seq_length, batch, attention_hidden_size)
+                
+                probability = self.fc4(blended_output).squeeze(2) # (X_seq_length, batch)
+                probability = probability.transpose(0, 1) # (batch, X_seq_length)
+                probability = torch.nn.functional.log_softmax(probability, dim=1) # (batch, X_seq_length)
+                probabilities.append(probability)
+
+                indices = Y[..., i] # (batch)
+                decoder_input = X[range(batch_size), indices] # (batch, embedding_size)
+
+            probabilities = torch.stack(probabilities, dim=1) # (batch, Y_seq_length, X_seq_length)
+            indices = probabilities.argmax(dim=2) # (batch, Y_seq_length)
+            return probabilities, indices
+
+        else:
+
+            probability_groups = [] # list(batch * amplification, X_seq_length)
+            row_indices = [] # list(batch, amplification)
+            column_indices = [] #list(batch, amplification)
+
+            for i in range(Y_seq_length):
+                for j in range(self.lstm_layers):
+                    hidden_states[j], cell_states[j] = self.decoders[j](decoder_input, (hidden_states[j], cell_states[j])) # hidden_state:(batch * amplification, rnn_hidden_size), cell_state:(batch * amplification, rnn_hidden_size)
+                    decoder_input = hidden_states[j]
+                decoder_output = self.fc2(decoder_input) # (batch * amplification, attention_hidden_size)
+
+                amplifying_encoder_outputs = encoder_outputs[:, torch.arange(batch_size).repeat_interleave(1 if i == 0 else amplification)] # (X_seq_length, batch * amplification, attention_hidden_size)
+
+                blended_output = torch.tanh(amplifying_encoder_outputs + decoder_output) # (X_seq_length, batch * amplification, attention_hidden_size)
+                for j in range(self.fc_layers):
+                    blended_output = torch.tanh(self.fc3s[j](blended_output)) # (X_seq_length, batch * amplification, attention_hidden_size)
+
+                probability = self.fc4(blended_output).squeeze(2) # (X_seq_length, batch * amplification)
+                probability = probability.transpose(0, 1) # (batch * amplification, X_seq_length)
+                probability = torch.nn.functional.log_softmax(probability, dim=1) # (batch * amplification, X_seq_length)
+                total_probability = probability.view(batch_size, 1 if i == 0 else amplification, -1) # (batch, amplification, X_seq_length)
+                
+                if i != 0:
+                    total_probability = total_probability + accumulation_probability.unsqueeze(2) # (batch, amplification, X_seq_length)
+
+                v1, i1 = total_probability.topk(amplification, dim=2) # (batch, amplification, amplification)
+
+                v1 = v1.view(batch_size, -1) # (batch, amplification * amplification)
+                i1 = i1.view(batch_size, -1) # (batch, amplification * amplification)
+                
+                accumulation_probability, i2 = v1.topk(amplification, dim=1) # accumulation_scores:(batch, amplification), i2:(batch, amplification)
+
+                irow = i2 // amplification # (batch, amplification)
+                icolumn = i1[torch.arange(batch_size).unsqueeze(1), i2] # (batch, amplification)
+
+                row_indices.append(irow)
+                column_indices.append(icolumn)
+
+                irow_flat = irow + torch.arange(0, batch_size * amplification, amplification, device=device).unsqueeze(1) # (batch * amplification)
+                irow_flat = irow_flat.view(-1) // (amplification if i == 0 else 1) # (batch * amplification)
+
+                for j in range(self.lstm_layers):
+                    hidden_states[j] = hidden_states[j][irow_flat] # (batch * amplification, rnn_hidden_size)
+                    cell_states[j] = cell_states[j][irow_flat] # (batch * amplification, rnn_hidden_size)
+                probability_group = probability[irow_flat].view(batch_size, amplification, -1) # (batch, amplification, X_seq_length)
+                probability_groups.append(probability_group) 
+
+                decoder_input = X[torch.arange(batch_size).unsqueeze(1), icolumn] # (batch, amplification, embedding_size)
+                decoder_input = decoder_input.view(batch_size * amplification, -1) # (batch * amplification, embedding_size)
+
+            row_indices = torch.stack(row_indices) # (Y_seq_length, batch, amplification)
+            probability_groups = torch.stack(probability_groups) # (Y_seq_length, batch, amplification, X_seq_length)
+            column_indices = torch.stack(column_indices) # (Y_seq_length, batch, amplification)
+
+            probabilities = []
+            indices = []
+
+            j = torch.zeros(batch_size, dtype=torch.long) # (batch)
+            for i in reversed(range(Y_seq_length)):
+                probabilities.append(probability_groups[i][range(batch_size), j])
+                indices.append(column_indices[i][range(batch_size), j])
+                j = row_indices[i][range(batch_size), j] # (batch)
+
+            probabilities = torch.stack(probabilities[::-1], dim=1) # (batch, Y_seq_length, X_seq_length)
+            indices = torch.stack(indices[::-1], dim=1) # (batch, Y_seq_length)
+            return probabilities, indices
+
+def trainOneEpoch(dataLoader, model, optimizer):
+    average_loss = 0.0
+    batch_count = 0
+    correct_samples = 0
+    total_samples = 0
+
+    for samples in dataLoader:
+    
+        X_samples = samples[0] # (batch, X_seq_length, input_size)
+        Y_samples = samples[1] # (batch, Y_seq_length)
+        X_seq_length = X_samples.size(1)
+
+        probabilities, indices = model(X_samples, True, Y_samples) # probabilities:(batch, Y_seq_length, X_seq_length), indices:(batch, Y_seq_length)
+
+        correct_samples += sum([1 if torch.equal(x.data, y.data) else 0 for x, y in zip(indices, Y_samples)])
+        total_samples += Y_samples.size(0)
+
+        probabilities = probabilities.view(-1, X_seq_length) # (batch * Y_seq_length, X_seq_length)
+        Y_samples = Y_samples.view(-1) # (batch * Y_seq_length)
+        loss = torch.nn.functional.nll_loss(probabilities, Y_samples) # (1)
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+        average_loss += loss.item()
+        batch_count += 1
+
+    return average_loss / batch_count, correct_samples / total_samples
+
+def testOneEpoch(dataLoader, model, amplification=1):
+    average_loss = 0.0
+    batch_count = 0
+    correct_samples = 0
+    total_samples = 0
+    incorrect_samples = []
+
+    for samples in dataLoader:
+    
+        X_samples = samples[0] # (batch, X_seq_length, input_size)
+        Y_samples = samples[1] # (batch, Y_seq_length)
+        X_seq_length = X_samples.size(1)
+
+        probabilities, indices = model(X_samples, False, Y_samples, amplification) # probabilities:(batch, Y_seq_length, X_seq_length), indices:(batch, Y_seq_length)
+        total_samples += Y_samples.size(0)
+
+        batch_loss = 0.0
+        for i in range(Y_samples.size(0)):
+            loss = torch.nn.functional.nll_loss(probabilities[i], Y_samples[i])
+
+            if torch.equal(indices[i], Y_samples[i]):
+                correct_samples += 1
+            else:
+                incorrect_samples.append([X_samples[i], Y_samples[i], indices[i]])
+
+            batch_loss += loss.item()
+
+        average_loss += batch_loss / Y_samples.size(0)
+        batch_count += 1
+
+    return average_loss / batch_count, correct_samples / total_samples, random.choices(incorrect_samples, k=3)
+
+def normalizeIncorrectSample(sample):
+    points = sample[0].tolist()
+    Y_indices = sample[1].tolist()
+    P_indices = sample[2].tolist()
+
+    points = [e[:2] for e in points]
+    points = [e for e in points if e != points[0]]
+    Y_indices = [e for e in Y_indices if e != 0]
+    P_indices = [e for e in P_indices if e != 0]
+
+    return [points, Y_indices, P_indices]
+
+def train(options):
+    print(options.__dict__)
+
+    trainingDataset = Dataset(options.training_data_filename)
+    testDataset = Dataset(options.test_data_filename)
+    trainingDataLoader = torch.utils.data.DataLoader(trainingDataset, shuffle=True, collate_fn=collate_fn, batch_size=options.training_batch_size)
+    testDataLoader = torch.utils.data.DataLoader(testDataset, shuffle=True, collate_fn=collate_fn, batch_size=options.test_batch_size)
+
+    model = PointerNetwork(
+        options.input_size, 
+        options.embedding_size, 
+        options.rnn_hidden_size, 
+        options.attention_hidden_size,
+        options.lstm_layers,
+        options.fc_layers).to(device)
+    print(model.parameters)
+
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-5)
+    scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=1e-3**(1/options.total_epochs))
+
+    last_epoch = 0
+    if options.checkpoint != None:
+        checkpoint = torch.load(options.checkpoint)
+        last_epoch = checkpoint['epoch']
+        model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+        print('Loaded checkpoint, last_epoch=', last_epoch)
+
+    for epoch in range(last_epoch + 1, options.total_epochs + 1):
+
+        model.train()
+        training_loss, training_accuracy = trainOneEpoch(trainingDataLoader, model, optimizer)
+
+        model.eval()
+        with torch.no_grad():
+            test_loss_beam_search, test_accuracy_beam_search, incorrect_samples_beam_search = testOneEpoch(testDataLoader, model, options.amplification)
+            test_loss, test_accuracy, _ = testOneEpoch(testDataLoader, model)
+
+        lr = optimizer.param_groups[0]['lr']
+
+        scheduler.step()
+
+        print('Epoch: {:3}, LR: {:.3e}, Training: ({:.3f}, {:.1f}%), Test: ({:.3f}, {:.1f}%) ({:.3f}, {:.1f}%)'.format(
+            epoch, 
+            lr,
+            training_loss,
+            training_accuracy * 100, 
+            test_loss_beam_search,
+            test_accuracy_beam_search * 100,
+            test_loss,
+            test_accuracy * 100))
+
+        incorrect_samples_beam_search = [normalizeIncorrectSample(sample) for sample in incorrect_samples_beam_search]
+
+        for sample in incorrect_samples_beam_search:
+            print(sample)
+        print()
+
+        torch.save({
+            'epoch': epoch,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict()
+        }, 'models/ch_epoch_{}'.format(epoch))
+
+if __name__ == '__main__':
+    train(Options(
+        training_data_filename='data/mwt_all_training.txt',
+        test_data_filename='data/mwt_all_test.txt',
+        input_size=7,
+        embedding_size=256, 
+        rnn_hidden_size=256,
+        attention_hidden_size=256, 
+        lstm_layers=2,
+        fc_layers=3,
+        amplification=3,
+        training_batch_size=500, 
+        test_batch_size=50,
+        total_epochs=100))

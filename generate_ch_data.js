@@ -1,57 +1,71 @@
 const crypto = require('crypto');
 const fs = require('fs');
 
-class RandomNumberPool {
+class RandomEngine {
     constructor() {
         this.size = 1024;
         this.array = new Uint32Array(this.size);
-        this.offset = 0;
+        this.refill();
+    }
+
+    refill() {
         crypto.randomFillSync(this.array);
+        this.offset = 0;
     }
 
     next() {
         if (this.offset === this.size) {
-            crypto.randomFillSync(this.array);
-            this.offset = 0;
+            this.refill();
         }
         return this.array[this.offset++];
     }
 }
 
-function combineIndex(index1, index2, orderInsensitive = false) {
-    if (orderInsensitive) {
-        if (index1 > index2) {
-            [index1, index2] = [index2, index1];
-        }
+function pair(a, b, c = undefined) {
+    if (c === undefined) {
+        return (a + b) * (a + b + 1) / 2 + b;
+    } else {
+        return pair(pair(a, b), c);
     }
-    return (index1 + index2) * (index1 + index2 + 1) / 2 + index1;
 }
 
-function generatePoints(rnp, sideLength, distinguishability, number) {
-    const points = [];
+function* randomPoints(randomEngine, pointNumber) {
+    const resolution = 1024;
+    const grid = 16;
+    const padding = 4;
 
-    const center = { x: sideLength / 2, y: sideLength / 2 };
-    const radius2 = Math.pow(Math.min(sideLength / 2, sideLength / 2), 2);
+    const center = { x: resolution / 2, y: resolution / 2 };
+    const radius2 = Math.pow(Math.min(resolution / 2, resolution / 2), 2);
 
     const pointList = new Set();
-    while (points.length < number) {
-        let x = rnp.next() % sideLength;
-        let y = rnp.next() % sideLength;
+    while (pointList.size < pointNumber) {
+        let x = randomEngine.next() % resolution;
+        let y = randomEngine.next() % resolution;
 
         if ((x - center.x) * (x - center.x) + (y - center.y) * (y - center.y) > radius2) {
             continue;
         }
 
-        const pointIndex = combineIndex(Math.floor(x / distinguishability), Math.floor(y / distinguishability));
+        const pointIndex = pair(Math.floor(x / grid), Math.floor(y / grid));
         if (pointList.has(pointIndex)) {
             continue;
         }
 
-        points.push({ x: x / sideLength, y: y / sideLength });
+        if (x % grid < padding) {
+            x += padding;
+        } else if (x % grid >= grid - padding) {
+            x -= padding;
+        }
+
+        if (y % grid < padding) {
+            y += padding;
+        } else if (y % grid >= grid - padding) {
+            y -= padding;
+        }
+
+        yield { x: x / resolution, y: y / resolution };
         pointList.add(pointIndex);
     }
-
-    return points;
 }
 
 function anticlockwise(p1, p2, p3) {
@@ -140,15 +154,15 @@ function findConvexHullIndices(pointList) {
     }
 }
 
-function generate(fileName, maxPointNumber, quantityForEachPointNumber, sideLength, distinguishability) {
+function generate(fileName, maxPointNumber, quantityForEachPointNumber) {
     fs.writeFileSync(fileName, '', { flag: 'w' });
 
-    const rnp = new RandomNumberPool();
+    const randomEngine = new RandomEngine();
 
     for (let pointNumber = 5; pointNumber <= maxPointNumber; pointNumber++) {
 
         for (let i = 0; i < quantityForEachPointNumber; i++) {
-            const pointList = generatePoints(rnp, sideLength, distinguishability, pointNumber);
+            const pointList = [...randomPoints(randomEngine, pointNumber)];
             const convexHullPointIndices = findConvexHullIndices(pointList);
 
             const minIndex = Math.min(...convexHullPointIndices);
@@ -165,5 +179,5 @@ function generate(fileName, maxPointNumber, quantityForEachPointNumber, sideLeng
     }
 }
 
-generate('data/ch_all_training.txt', 50, 20000, 128, 16);
-generate('data/ch_all_test.txt', 50, 1000, 128, 16);
+generate('data/ch_all_training.txt', 50, 20000);
+generate('data/ch_all_test.txt', 50, 1000);
